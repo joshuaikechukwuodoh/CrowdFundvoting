@@ -1,0 +1,542 @@
+================================================================================
+  PROJECT EXPLANATION: CrowdFund (Blockchain Crowdfunding)
+================================================================================
+
+Your folder is named "votingblockchain", but the real app inside is
+"crowdfund" — a decentralized Kickstarter-style app on Ethereum.
+
+People create campaigns, others send ETH, and if the goal is met the creator
+claims the money; if not, donors can get refunds.
+
+It is NOT a voting system. It is crowdfunding with a smart contract.
+
+
+================================================================================
+  BIG PICTURE: 3 LAYERS
+================================================================================
+
+  +---------------------------------------------------+
+  |  FRONTEND (React + Vite)  -->  port 5173          |
+  |  UI + MetaMask wallet + direct TX to chain        |
+  +----------------------+----------------------------+
+                         | reads via API
+                         v
+  +---------------------------------------------------+
+  |  BACKEND (Express)  -->  port 3001                |
+  |  Reads chain + stores images/description          |
+  |  in PostgreSQL + Cloudinary                       |
+  +----------------------+----------------------------+
+                         | ethers.js
+                         v
+  +---------------------------------------------------+
+  |  SMART CONTRACT (CrowdFund.sol)                   |
+  |  Real money logic: create / donate / claim /      |
+  |  refund — lives on Hardhat local or chain         |
+  +---------------------------------------------------+
+
+RULE OF THUMB:
+  - Money & rules              --> smart contract (on-chain)
+  - Pretty extra info          --> backend + database (off-chain)
+    (description, image, category)
+  - UI + wallet                --> frontend
+
+
+================================================================================
+  1. SMART CONTRACT — contracts/CrowdFund.sol
+================================================================================
+
+This is the core of the project.
+
+
+--- Data it stores ---
+
+  Piece                          Meaning
+  ---------------------------    ---------------------------------------------
+  Campaign struct                creator, goal, deadline, amountRaised,
+                                 claimed, title
+  campaignCount                  how many campaigns exist
+  campaigns[id]                  campaign by ID (0, 1, 2...)
+  contributions[id][address]     how much each person donated to that campaign
+
+
+--- Main functions ---
+
+  1. createCampaign(goal, durationInDays, title)
+     - Anyone can start a campaign.
+     - Deadline = now + N days.
+     - Emits CampaignCreated event.
+
+  2. contribute(id)  [payable — send ETH with the call]
+     - Only while campaign is still open.
+     - Increases amountRaised and records the donor's amount.
+
+  3. claim(id)
+     - Only the CREATOR.
+     - Only AFTER the deadline.
+     - Only if GOAL WAS REACHED.
+     - Only ONCE.
+     - Sends all raised ETH to the creator.
+
+  4. refund(id)
+     - Only AFTER the deadline.
+     - Only if GOAL WAS NOT REACHED.
+     - Donor gets their contribution back (once).
+
+  5. getCampaign / getContribution
+     - Read-only helpers.
+
+
+--- Business rules (like Kickstarter) ---
+
+  Active                      --> people can donate
+  Ended + goal met            --> creator can claim
+  Ended + goal missed         --> donors can refund
+
+
+--- Other contract-related files ---
+
+  Counter.sol
+    - Hardhat sample (increment a number).
+    - NOT used by the crowdfund app.
+
+  scripts/deploy.ts
+    - Deploys CrowdFund and prints the contract address.
+
+
+================================================================================
+  2. BACKEND — backend/src/
+================================================================================
+
+Express API that READS the blockchain and ADDS extra metadata.
+
+
+--- Important files ---
+
+  File                Role
+  ----------------    --------------------------------------------------------
+  index.ts            All API routes
+  db/schema.ts        PostgreSQL table for campaign metadata
+  db/index.ts         Drizzle + Postgres connection
+  crowdfund.json      Contract ABI (function signatures for ethers)
+
+
+--- What the DB stores (off-chain) ---
+
+  From schema.ts:
+    - title
+    - description
+    - image URL
+    - category
+    - copies of on-chain fields for convenience
+    - linked by onChainId
+
+
+--- API routes ---
+
+  Method   Path                                      What it does
+  ------   ---------------------------------------   -------------------------
+  GET      /health                                   Is server up? contract+RPC
+  GET      /campaigns                                All campaigns (chain+DB)
+  GET      /campaigns/:id                            One campaign
+  GET      /campaigns/count                          How many campaigns
+  GET      /campaigns/:id/contributions/:address     How much that address
+                                                     donated
+  POST     /campaigns/:id/metadata                   Save description/image/
+                                                     category
+  POST     /upload                                   Upload image --> Cloudinary
+                                                     --> returns URL
+
+
+--- Why backend exists ---
+
+  Putting long text + images on-chain is expensive. So:
+
+    On-chain:   title, goal, deadline, money
+    Off-chain:  description, image, category
+
+  The backend MERGES both when you call GET /campaigns.
+
+
+--- Config it needs (.env) ---
+
+  DATABASE_URL         Postgres connection string
+  CONTRACT_ADDRESS     Deployed CrowdFund address
+  RPC_URL              Usually http://127.0.0.1:8545
+  CLOUDINARY_*         Cloudinary keys for image upload
+
+
+================================================================================
+  3. FRONTEND — frontend/src/
+================================================================================
+
+React app with Tailwind. Users connect MetaMask and interact with the contract.
+
+
+--- Routing (App.tsx) ---
+
+  Route              Page
+  ---------------    ---------------------------------------------------------
+  /                  Home — list campaigns
+  /create            Create campaign form
+  /campaigns/:id     Campaign detail + donate/claim/refund
+
+  Wrapped in WalletProvider so wallet state is global.
+
+
+--- Wallet (hooks/useWallet.tsx) ---
+
+  Talks to MetaMask (window.ethereum):
+
+    - Connect / disconnect
+    - Show address + ETH balance
+    - Detect chain ID (expects Hardhat local 31337 by default)
+    - Switch / add Hardhat network
+    - getSigner() for sending transactions
+
+
+--- Contract helper (lib/contract.ts) ---
+
+  - Contract address from VITE_CONTRACT_ADDRESS
+  - ABI for create / contribute / claim / refund / reads
+  - getContract(signer) — ethers Contract instance
+
+  IMPORTANT:
+    Writing money (create, donate, claim, refund)
+      --> frontend --> MetaMask --> blockchain
+
+    Reading lists / metadata
+      --> frontend --> backend API
+
+
+--- API client (api/client.ts) ---
+
+  Thin fetch wrappers:
+    - fetchCampaigns
+    - fetchCampaign
+    - saveMetadata
+    - uploadImage
+    - etc.
+
+
+--- Pages ---
+
+  Home.tsx
+    - Loads campaigns from API
+    - Stats (count, active, ETH raised)
+    - Search + category + status filters
+    - Renders CampaignCard grid
+
+  CreateCampaign.tsx — multi-step flow:
+    1. Connect wallet / right network
+    2. Call createCampaign on-chain (MetaMask confirms)
+    3. Read CampaignCreated event (or campaignCount - 1) for new ID
+    4. Optional image --> backend /upload
+    5. Description/category --> backend /metadata
+    6. Navigate to campaign page
+
+  CampaignDetail.tsx
+    - Loads campaign + your contribution
+    - Contribute if active
+    - Claim if you are creator and goal succeeded
+    - Refund if you donated and campaign failed
+
+
+--- UI components ---
+
+  Component          Role
+  ---------------    ---------------------------------------------------------
+  Layout             Shell, background, footer
+  Navbar             Links + Connect Wallet
+  CampaignCard       Card on home grid
+  ProgressBar        % funded
+  StatusBadge        active / successful / failed / claimed
+  LoadingSpinner     Loading UI
+  EmptyState         Empty UI
+
+
+--- Helpers (lib/format.ts, lib/types.ts) ---
+
+  - Short address (0x1234...abcd)
+  - Format ETH / dates
+  - getCampaignStatus() — active vs successful vs failed vs claimed
+  - TypeScript types for campaigns and categories
+
+
+================================================================================
+  FULL USER FLOWS
+================================================================================
+
+--- Create a campaign ---
+
+  User fills form
+    --> MetaMask signs createCampaign(goal, days, title)
+    --> ETH rules live on-chain
+    --> Frontend uploads image + saves description/category to backend
+    --> User sees campaign page
+
+
+--- Donate ---
+
+  User enters amount on detail page
+    --> MetaMask signs contribute(id) with value = ETH
+    --> Contract holds the ETH and updates amountRaised
+
+
+--- Success ---
+
+  Deadline passes + raised >= goal
+    --> Creator clicks Claim
+    --> Contract sends all ETH to creator
+
+
+--- Failure ---
+
+  Deadline passes + raised < goal
+    --> Donor clicks Refund
+    --> Contract returns their contribution
+
+
+================================================================================
+  HOW PIECES TALK TO EACH OTHER
+================================================================================
+
+  [Browser React]
+       |
+       |---> MetaMask ---> CrowdFund.sol
+       |     (write: create / contribute / claim / refund)
+       |
+       +---> Express API ---> ethers read CrowdFund.sol
+                         +--> Postgres (description, image, category)
+                         +--> Cloudinary (images)
+
+
+================================================================================
+  TECH STACK SUMMARY
+================================================================================
+
+  Layer        Tech
+  ---------    ---------------------------------------------------------------
+  Contract     Solidity 0.8.x, Hardhat 3, ethers
+  Backend      Express 5, Drizzle ORM, Postgres, Cloudinary, Multer
+  Frontend     React 19, Vite, Tailwind 4, React Router, ethers
+
+
+================================================================================
+  PROJECT FOLDER STRUCTURE (simplified)
+================================================================================
+
+  crowdfund/
+  |-- contracts/                 # Hardhat / Solidity
+  |   |-- CrowdFund.sol          # Main smart contract
+  |   |-- Counter.sol            # Sample only (not used by app)
+  |   |-- Counter.t.sol
+  |
+  |-- scripts/
+  |   |-- deploy.ts              # Deploy CrowdFund
+  |
+  |-- hardhat.config.ts
+  |
+  |-- backend/                   # Express + Drizzle
+  |   |-- src/
+  |   |   |-- index.ts           # API server
+  |   |   |-- crowdfund.json     # ABI
+  |   |   |-- db/
+  |   |       |-- index.ts
+  |   |       |-- schema.ts
+  |   |-- drizzle.config.ts
+  |   |-- package.json
+  |
+  |-- frontend/                  # React + Vite + Tailwind
+  |   |-- src/
+  |   |   |-- api/
+  |   |   |   |-- client.ts
+  |   |   |-- components/
+  |   |   |   |-- CampaignCard.tsx
+  |   |   |   |-- EmptyState.tsx
+  |   |   |   |-- Layout.tsx
+  |   |   |   |-- LoadingSpinner.tsx
+  |   |   |   |-- Navbar.tsx
+  |   |   |   |-- ProgressBar.tsx
+  |   |   |   |-- StatusBadge.tsx
+  |   |   |-- hooks/
+  |   |   |   |-- useWallet.tsx
+  |   |   |-- lib/
+  |   |   |   |-- contract.ts
+  |   |   |   |-- format.ts
+  |   |   |   |-- types.ts
+  |   |   |-- pages/
+  |   |   |   |-- Home.tsx
+  |   |   |   |-- CreateCampaign.tsx
+  |   |   |   |-- CampaignDetail.tsx
+  |   |   |-- App.tsx
+  |   |   |-- main.tsx
+  |   |-- package.json
+  |
+  |-- package.json
+  |-- README.md
+
+
+================================================================================
+  WHAT IS NOT THE MAIN APP
+================================================================================
+
+  - Counter.sol / Counter tests / Ignition Counter module
+      --> Hardhat demo leftovers
+
+  - Folder name "votingblockchain"
+      --> Misleading; this is crowdfunding, not voting
+
+
+================================================================================
+  MENTAL MODEL (ONE SENTENCE)
+================================================================================
+
+  The smart contract is the bank vault and the rules;
+  the backend is the brochure (images/text);
+  the frontend is the website where you connect your wallet and press the
+  buttons.
+
+
+================================================================================
+  SMART CONTRACT CODE WALKTHROUGH (CrowdFund.sol)
+================================================================================
+
+  --- Struct Campaign ---
+    creator       Who created the campaign (wallet address)
+    goal          How much ETH they want (stored in wei)
+    deadline      Unix timestamp when fundraising ends
+    amountRaised  Total ETH donated so far
+    claimed       Whether creator already withdrew funds
+    title         Campaign name
+
+  --- createCampaign ---
+    Checks: goal > 0, duration > 0
+    Assigns next ID from campaignCount
+    Saves Campaign with creator = msg.sender
+    deadline = block.timestamp + (days * 1 days)
+    Emits CampaignCreated
+    Returns the new campaign ID
+
+  --- contribute ---
+    Checks: campaign still open, msg.value > 0
+    Adds msg.value to amountRaised
+    Adds to contributions[id][msg.sender]
+    Emits Contributed
+    ETH stays inside the contract balance
+
+  --- claim ---
+    Checks:
+      - caller is creator
+      - deadline passed
+      - amountRaised >= goal
+      - not already claimed
+    Sets claimed = true
+    Sends all amountRaised to creator via call{value}
+    Emits Claimed
+
+  --- refund ---
+    Checks:
+      - deadline passed
+      - amountRaised < goal
+      - caller has contribution > 0
+    Sets contribution to 0 first (reentrancy safety)
+    Sends that amount back to donor
+    Emits Refunded
+
+
+================================================================================
+  BACKEND CODE WALKTHROUGH (backend/src/index.ts)
+================================================================================
+
+  Startup:
+    - Loads env (PORT, RPC_URL, CONTRACT_ADDRESS, Cloudinary)
+    - Connects ethers JsonRpcProvider to blockchain
+    - Creates Contract instance with ABI + address
+    - Starts Express on port 3001 (default)
+
+  formatCampaign():
+    Converts wei bigints to ETH strings for JSON responses
+
+  GET /campaigns:
+    1. Read campaignCount from contract
+    2. Load all metadata rows from Postgres
+    3. For each on-chain ID, getCampaign + merge description/image/category
+    4. Return JSON array
+
+  GET /campaigns/:id:
+    Same merge for one campaign; 404 if creator is zero address
+
+  POST /campaigns/:id/metadata:
+    Verifies campaign exists on-chain
+    Insert or update Postgres row for description/image/category
+
+  POST /upload:
+    Multer receives image (max 5MB)
+    Streams to Cloudinary folder "crowdfund"
+    Returns secure_url
+
+
+================================================================================
+  FRONTEND CODE WALKTHROUGH
+================================================================================
+
+  --- useWallet.tsx ---
+    WalletProvider holds: address, balance, chainId, provider
+    connect()        --> eth_requestAccounts
+    switchNetwork()  --> wallet_switchEthereumChain (or add Hardhat)
+    getSigner()      --> used to sign transactions
+    Listens to accountsChanged and chainChanged
+
+  --- CreateCampaign.tsx ---
+    Validates form (title, goal > 0, days >= 1)
+    contract.createCampaign(parseEther(goal), days, title)
+    Waits for tx receipt
+    Parses CampaignCreated for id
+    Optional uploadImage + saveMetadata
+    navigate to /campaigns/:id
+
+  --- CampaignDetail.tsx ---
+    canContribute = status === 'active'
+    canClaim      = isCreator && status === 'successful'
+    canRefund     = !isCreator && status === 'failed' && hasContribution
+    Calls contract.contribute / claim / refund with signer
+
+  --- format.ts getCampaignStatus ---
+    claimed     --> 'claimed'
+    now < deadline --> 'active'
+    raised >= goal --> 'successful'
+    else        --> 'failed'
+
+
+================================================================================
+  HOW TO RUN LOCALLY (overview)
+================================================================================
+
+  1. Start blockchain (Hardhat node)
+       npx hardhat node
+
+  2. Deploy CrowdFund
+       npx hardhat run scripts/deploy.ts --network localhost
+     Copy printed address into:
+       - backend .env  --> CONTRACT_ADDRESS
+       - frontend .env --> VITE_CONTRACT_ADDRESS
+
+  3. Start Postgres + set DATABASE_URL
+     Run: npm run db:push  (in backend)
+
+  4. Start backend
+       cd backend && npm run dev
+     --> http://localhost:3001
+
+  5. Start frontend
+       cd frontend && npm run dev
+     --> http://localhost:5173
+
+  6. MetaMask
+     - Network: Hardhat Local, chain id 31337, RPC http://127.0.0.1:8545
+     - Import a Hardhat test account private key for free test ETH
+
+
+================================================================================
+  END OF DOCUMENT
+================================================================================
