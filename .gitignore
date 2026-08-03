@@ -1,0 +1,30 @@
+﻿# Dependencies
+node_modules/
+
+# Environment secrets (keep local only)
+.env
+.env.local
+.env.*.local
+**/.env
+!**/.env.example
+
+# Build / cache
+dist/
+build/
+cache/
+artifacts/
+coverage/
+*.tsbuildinfo
+
+# Logs & OS
+*.log
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+*.swp
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+.gitignore
